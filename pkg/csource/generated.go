@@ -51,10 +51,12 @@ NORETURN void doexit(int status)
 	for (;;) {
 	}
 }
+#if !GOOS_fuchsia
 NORETURN void doexit_thread(int status)
 {
 	doexit(status);
 }
+#endif
 #endif
 
 #if SYZ_EXECUTOR || SYZ_MULTI_PROC || SYZ_REPEAT && SYZ_CGROUPS ||         \
@@ -216,6 +218,18 @@ static void use_temporary_dir(void)
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#if GOOS_freebsd
+static void reset_flags(const char* filename)
+{
+	struct stat st;
+	if (lstat(filename, &st))
+		exitf("lstat(%s) failed", filename);
+	st.st_flags &= ~(SF_NOUNLINK | UF_NOUNLINK | SF_IMMUTABLE | UF_IMMUTABLE | SF_APPEND | UF_APPEND);
+	if (lchflags(filename, st.st_flags))
+		exitf("lchflags(%s) failed", filename);
+}
+#endif
 static void __attribute__((noinline)) remove_dir(const char* dir)
 {
 	DIR* dp = opendir(dir);
@@ -240,12 +254,29 @@ static void __attribute__((noinline)) remove_dir(const char* dir)
 			remove_dir(filename);
 			continue;
 		}
-		if (unlink(filename))
+		if (unlink(filename)) {
+#if GOOS_freebsd
+			if (errno == EPERM) {
+				reset_flags(filename);
+				reset_flags(dir);
+				if (unlink(filename) == 0)
+					continue;
+			}
+#endif
 			exitf("unlink(%s) failed", filename);
+		}
 	}
 	closedir(dp);
-	if (rmdir(dir))
+	while (rmdir(dir)) {
+#if GOOS_freebsd
+		if (errno == EPERM) {
+			reset_flags(dir);
+			if (rmdir(dir) == 0)
+				break;
+		}
+#endif
 		exitf("rmdir(%s) failed", dir);
+	}
 }
 #endif
 #endif
@@ -2268,7 +2299,7 @@ static long syz_future_time(volatile long when)
 		break;
 	}
 	zx_time_t now = 0;
-	zx_clock_get(ZX_CLOCK_MONOTONIC, &now);
+	zx_clock_read(ZX_CLOCK_MONOTONIC, &now);
 	return now + delta_ms * 1000 * 1000;
 }
 #endif
@@ -2391,7 +2422,7 @@ static bool write_file(const char* file, const char* what, ...)
 #endif
 
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_NET_INJECTION || SYZ_DEVLINK_PCI || SYZ_WIFI || SYZ_802154 || \
-    __NR_syz_genetlink_get_family_id || __NR_syz_80211_inject_frame || __NR_syz_80211_join_ibss
+    __NR_syz_genetlink_get_family_id || __NR_syz_80211_inject_frame || __NR_syz_80211_join_ibss || SYZ_NIC_VF
 #include <arpa/inet.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -2453,6 +2484,87 @@ static void netlink_done(struct nlmsg* nlmsg)
 	struct nlattr* attr = nlmsg->nested[--nlmsg->nesting];
 	attr->nla_len = nlmsg->pos - (char*)attr;
 }
+
+#if SYZ_EXECUTOR || SYZ_NIC_VF
+#include <ifaddrs.h>
+#include <linux/ethtool.h>
+#include <linux/sockios.h>
+#include <sys/ioctl.h>
+
+struct vf_intf {
+	char pass_thru_intf[IFNAMSIZ];
+	int ppid;
+};
+
+static struct vf_intf vf_intf;
+
+static void find_vf_interface(void)
+{
+#if SYZ_EXECUTOR
+	if (!flag_nic_vf)
+		return;
+#endif
+	struct ifaddrs* addresses = NULL;
+	int pid = getpid();
+	int ret = 0;
+
+	memset(&vf_intf, 0, sizeof(struct vf_intf));
+
+	debug("Checking for VF pass-thru interface.\n");
+	if (getifaddrs(&addresses) == -1) {
+		debug("%s: getifaddrs() failed.\n", __func__);
+		return;
+	}
+
+	int fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+
+	if (fd < 0) {
+		debug("%s: socket() failed.\n", __func__);
+		return;
+	}
+	struct ifreq ifr;
+	struct ethtool_drvinfo drvinfo;
+	struct ifaddrs* address = addresses;
+
+	while (address) {
+		debug("ifa_name: %s\n", address->ifa_name);
+		memset(&ifr, 0, sizeof(struct ifreq));
+		strcpy(ifr.ifr_name, address->ifa_name);
+		memset(&drvinfo, 0, sizeof(struct ethtool_drvinfo));
+		drvinfo.cmd = ETHTOOL_GDRVINFO;
+		ifr.ifr_data = (caddr_t)&drvinfo;
+		ret = ioctl(fd, SIOCETHTOOL, &ifr);
+
+		if (ret < 0) {
+			debug("%s: ioctl() failed.\n", __func__);
+		} else if (strlen(drvinfo.bus_info)) {
+			debug("bus_info: %s, strlen(drvinfo.bus_info)=%zu\n",
+			      drvinfo.bus_info, strlen(drvinfo.bus_info));
+			if (strcmp(drvinfo.bus_info, "0000:00:11.0") == 0) {
+				if (strlen(address->ifa_name) < IFNAMSIZ) {
+					strncpy(vf_intf.pass_thru_intf,
+						address->ifa_name, IFNAMSIZ);
+					vf_intf.ppid = pid;
+				} else {
+					debug("%s: %d strlen(%s) >= IFNAMSIZ.\n",
+					      __func__, pid, address->ifa_name);
+				}
+				break;
+			}
+		}
+		address = address->ifa_next;
+	}
+	freeifaddrs(addresses);
+	if (!vf_intf.ppid) {
+		memset(&vf_intf, 0, sizeof(struct vf_intf));
+		debug("%s: %d could not find VF pass-thru interface.\n", __func__, pid);
+		return;
+	}
+	debug("%s: %d found VF pass-thru interface %s\n",
+	      __func__, pid, vf_intf.pass_thru_intf);
+}
+#endif
+
 #endif
 
 static int netlink_send_ext(struct nlmsg* nlmsg, int sock,
@@ -2565,10 +2677,12 @@ static int netlink_next_msg(struct nlmsg* nlmsg, unsigned int offset,
 
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES || SYZ_802154
 static void netlink_add_device_impl(struct nlmsg* nlmsg, const char* type,
-				    const char* name)
+				    const char* name, bool up)
 {
 	struct ifinfomsg hdr;
 	memset(&hdr, 0, sizeof(hdr));
+	if (up)
+		hdr.ifi_flags = hdr.ifi_change = IFF_UP;
 	netlink_init(nlmsg, RTM_NEWLINK, NLM_F_EXCL | NLM_F_CREATE, &hdr, sizeof(hdr));
 	if (name)
 		netlink_attr(nlmsg, IFLA_IFNAME, name, strlen(name));
@@ -2581,7 +2695,7 @@ static void netlink_add_device_impl(struct nlmsg* nlmsg, const char* type,
 static void netlink_add_device(struct nlmsg* nlmsg, int sock, const char* type,
 			       const char* name)
 {
-	netlink_add_device_impl(nlmsg, type, name);
+	netlink_add_device_impl(nlmsg, type, name, false);
 	netlink_done(nlmsg);
 	int err = netlink_send(nlmsg, sock);
 	if (err < 0) {
@@ -2592,7 +2706,7 @@ static void netlink_add_device(struct nlmsg* nlmsg, int sock, const char* type,
 static void netlink_add_veth(struct nlmsg* nlmsg, int sock, const char* name,
 			     const char* peer)
 {
-	netlink_add_device_impl(nlmsg, "veth", name);
+	netlink_add_device_impl(nlmsg, "veth", name, false);
 	netlink_nest(nlmsg, IFLA_INFO_DATA);
 	netlink_nest(nlmsg, VETH_INFO_PEER);
 	nlmsg->pos += sizeof(struct ifinfomsg);
@@ -2606,10 +2720,24 @@ static void netlink_add_veth(struct nlmsg* nlmsg, int sock, const char* name,
 	}
 }
 
+static void netlink_add_xfrm(struct nlmsg* nlmsg, int sock, const char* name)
+{
+	netlink_add_device_impl(nlmsg, "xfrm", name, true);
+	netlink_nest(nlmsg, IFLA_INFO_DATA);
+	int if_id = 1;
+	netlink_attr(nlmsg, 2, &if_id, sizeof(if_id));
+	netlink_done(nlmsg);
+	netlink_done(nlmsg);
+	int err = netlink_send(nlmsg, sock);
+	if (err < 0) {
+		debug("netlink: adding device %s type xfrm if_id %d: %s\n", name, if_id, strerror(errno));
+	}
+}
+
 static void netlink_add_hsr(struct nlmsg* nlmsg, int sock, const char* name,
 			    const char* slave1, const char* slave2)
 {
-	netlink_add_device_impl(nlmsg, "hsr", name);
+	netlink_add_device_impl(nlmsg, "hsr", name, false);
 	netlink_nest(nlmsg, IFLA_INFO_DATA);
 	int ifindex1 = if_nametoindex(slave1);
 	netlink_attr(nlmsg, IFLA_HSR_SLAVE1, &ifindex1, sizeof(ifindex1));
@@ -2619,13 +2747,13 @@ static void netlink_add_hsr(struct nlmsg* nlmsg, int sock, const char* name,
 	netlink_done(nlmsg);
 	int err = netlink_send(nlmsg, sock);
 	if (err < 0) {
-		debug("netlink: adding device %s type hsr slave1 %s slave2 %s: %s\n", name, slave1, slave2, strerror(err));
+		debug("netlink: adding device %s type hsr slave1 %s slave2 %s: %s\n", name, slave1, slave2, strerror(errno));
 	}
 }
 
 static void netlink_add_linked(struct nlmsg* nlmsg, int sock, const char* type, const char* name, const char* link)
 {
-	netlink_add_device_impl(nlmsg, type, name);
+	netlink_add_device_impl(nlmsg, type, name, false);
 	netlink_done(nlmsg);
 	int ifindex = if_nametoindex(link);
 	netlink_attr(nlmsg, IFLA_LINK, &ifindex, sizeof(ifindex));
@@ -2637,7 +2765,7 @@ static void netlink_add_linked(struct nlmsg* nlmsg, int sock, const char* type, 
 
 static void netlink_add_vlan(struct nlmsg* nlmsg, int sock, const char* name, const char* link, uint16 id, uint16 proto)
 {
-	netlink_add_device_impl(nlmsg, "vlan", name);
+	netlink_add_device_impl(nlmsg, "vlan", name, false);
 	netlink_nest(nlmsg, IFLA_INFO_DATA);
 	netlink_attr(nlmsg, IFLA_VLAN_ID, &id, sizeof(id));
 	netlink_attr(nlmsg, IFLA_VLAN_PROTOCOL, &proto, sizeof(proto));
@@ -2653,7 +2781,7 @@ static void netlink_add_vlan(struct nlmsg* nlmsg, int sock, const char* name, co
 
 static void netlink_add_macvlan(struct nlmsg* nlmsg, int sock, const char* name, const char* link)
 {
-	netlink_add_device_impl(nlmsg, "macvlan", name);
+	netlink_add_device_impl(nlmsg, "macvlan", name, false);
 	netlink_nest(nlmsg, IFLA_INFO_DATA);
 	uint32 mode = MACVLAN_MODE_BRIDGE;
 	netlink_attr(nlmsg, IFLA_MACVLAN_MODE, &mode, sizeof(mode));
@@ -2669,7 +2797,7 @@ static void netlink_add_macvlan(struct nlmsg* nlmsg, int sock, const char* name,
 
 static void netlink_add_geneve(struct nlmsg* nlmsg, int sock, const char* name, uint32 vni, struct in_addr* addr4, struct in6_addr* addr6)
 {
-	netlink_add_device_impl(nlmsg, "geneve", name);
+	netlink_add_device_impl(nlmsg, "geneve", name, false);
 	netlink_nest(nlmsg, IFLA_INFO_DATA);
 	netlink_attr(nlmsg, IFLA_GENEVE_ID, &vni, sizeof(vni));
 	if (addr4)
@@ -2691,7 +2819,7 @@ static void netlink_add_geneve(struct nlmsg* nlmsg, int sock, const char* name, 
 
 static void netlink_add_ipvlan(struct nlmsg* nlmsg, int sock, const char* name, const char* link, uint16 mode, uint16 flags)
 {
-	netlink_add_device_impl(nlmsg, "ipvlan", name);
+	netlink_add_device_impl(nlmsg, "ipvlan", name, false);
 	netlink_nest(nlmsg, IFLA_INFO_DATA);
 	netlink_attr(nlmsg, IFLA_IPVLAN_MODE, &mode, sizeof(mode));
 	netlink_attr(nlmsg, IFLA_IPVLAN_FLAGS, &flags, sizeof(flags));
@@ -3322,10 +3450,9 @@ static void initialize_wifi_devices(void)
 
 static void netdevsim_add(unsigned int addr, unsigned int port_count)
 {
-	char buf[16];
-
-	sprintf(buf, "%u %u", addr, port_count);
-	if (write_file("/sys/bus/netdevsim/new_device", buf)) {
+	write_file("/sys/bus/netdevsim/del_device", "%u", addr);
+	if (write_file("/sys/bus/netdevsim/new_device", "%u %u", addr, port_count)) {
+		char buf[32];
 		snprintf(buf, sizeof(buf), "netdevsim%d", addr);
 		initialize_devlink_ports("netdevsim", buf, "netdevsim");
 	}
@@ -3560,6 +3687,52 @@ static void netlink_wireguard_setup(void)
 error:
 	close(sock);
 }
+
+#if SYZ_EXECUTOR || SYZ_NIC_VF
+static int runcmdline(char* cmdline)
+{
+	debug("%s\n", cmdline);
+	int ret = system(cmdline);
+	if (ret) {
+		debug("FAIL: %s\n", cmdline);
+	}
+	return ret;
+}
+
+static void netlink_nicvf_setup(void)
+{
+	char cmdline[256];
+
+#if SYZ_EXECUTOR
+	if (!flag_nic_vf)
+		return;
+#endif
+	if (!vf_intf.ppid)
+		return;
+
+	debug("ppid = %d, vf_intf.pass_thru_intf: %s\n",
+	      vf_intf.ppid, vf_intf.pass_thru_intf);
+
+	sprintf(cmdline, "nsenter -t 1 -n ip link set %s netns %d",
+		vf_intf.pass_thru_intf, getpid());
+	if (runcmdline(cmdline))
+		return;
+
+	sprintf(cmdline, "ip a s %s", vf_intf.pass_thru_intf);
+	if (runcmdline(cmdline))
+		return;
+
+	sprintf(cmdline, "ip link set %s down", vf_intf.pass_thru_intf);
+	if (runcmdline(cmdline))
+		return;
+
+	sprintf(cmdline, "ip link set %s name nicvf0", vf_intf.pass_thru_intf);
+	if (runcmdline(cmdline))
+		return;
+
+	debug("nicvf0 VF pass-through setup complete.\n");
+}
+#endif
 static void initialize_netdevices(void)
 {
 #if SYZ_EXECUTOR
@@ -3572,22 +3745,23 @@ static void initialize_netdevices(void)
 		const char* type;
 		const char* dev;
 	} devtypes[] = {
-	    {"ip6gretap", "ip6gretap0"},
-	    {"bridge", "bridge0"},
-	    {"vcan", "vcan0"},
-	    {"bond", "bond0"},
-	    {"team", "team0"},
-	    {"dummy", "dummy0"},
-	    {"nlmon", "nlmon0"},
-	    {"caif", "caif0"},
-	    {"batadv", "batadv0"},
-	    {"vxcan", "vxcan1"},
-	    {"netdevsim", netdevsim},
-	    {"veth", 0},
-	    {"xfrm", "xfrm0"},
-	    {"wireguard", "wg0"},
-	    {"wireguard", "wg1"},
-	    {"wireguard", "wg2"},
+		{"ip6gretap", "ip6gretap0"},
+		{"bridge", "bridge0"},
+		{"vcan", "vcan0"},
+		{"bond", "bond0"},
+		{"team", "team0"},
+		{"dummy", "dummy0"},
+#if SYZ_EXECUTOR || SYZ_NIC_VF
+		{"nicvf", "nicvf0"},
+#endif
+		{"nlmon", "nlmon0"},
+		{"caif", "caif0"},
+		{"batadv", "batadv0"},
+		{"vxcan", "vxcan1"},
+		{"veth", 0},
+		{"wireguard", "wg0"},
+		{"wireguard", "wg1"},
+		{"wireguard", "wg2"},
 	};
 	const char* devmasters[] = {"bridge", "bond", "team", "batadv"};
 	struct {
@@ -3595,64 +3769,67 @@ static void initialize_netdevices(void)
 		int macsize;
 		bool noipv6;
 	} devices[] = {
-	    {"lo", ETH_ALEN},
-	    {"sit0", 0},
-	    {"bridge0", ETH_ALEN},
-	    {"vcan0", 0, true},
-	    {"tunl0", 0},
-	    {"gre0", 0},
-	    {"gretap0", ETH_ALEN},
-	    {"ip_vti0", 0},
-	    {"ip6_vti0", 0},
-	    {"ip6tnl0", 0},
-	    {"ip6gre0", 0},
-	    {"ip6gretap0", ETH_ALEN},
-	    {"erspan0", ETH_ALEN},
-	    {"bond0", ETH_ALEN},
-	    {"veth0", ETH_ALEN},
-	    {"veth1", ETH_ALEN},
-	    {"team0", ETH_ALEN},
-	    {"veth0_to_bridge", ETH_ALEN},
-	    {"veth1_to_bridge", ETH_ALEN},
-	    {"veth0_to_bond", ETH_ALEN},
-	    {"veth1_to_bond", ETH_ALEN},
-	    {"veth0_to_team", ETH_ALEN},
-	    {"veth1_to_team", ETH_ALEN},
-	    {"veth0_to_hsr", ETH_ALEN},
-	    {"veth1_to_hsr", ETH_ALEN},
-	    {"hsr0", 0},
-	    {"dummy0", ETH_ALEN},
-	    {"nlmon0", 0},
-	    {"vxcan0", 0, true},
-	    {"vxcan1", 0, true},
-	    {"caif0", ETH_ALEN},
-	    {"batadv0", ETH_ALEN},
-	    {netdevsim, ETH_ALEN},
-	    {"xfrm0", ETH_ALEN},
-	    {"veth0_virt_wifi", ETH_ALEN},
-	    {"veth1_virt_wifi", ETH_ALEN},
-	    {"virt_wifi0", ETH_ALEN},
-	    {"veth0_vlan", ETH_ALEN},
-	    {"veth1_vlan", ETH_ALEN},
-	    {"vlan0", ETH_ALEN},
-	    {"vlan1", ETH_ALEN},
-	    {"macvlan0", ETH_ALEN},
-	    {"macvlan1", ETH_ALEN},
-	    {"ipvlan0", ETH_ALEN},
-	    {"ipvlan1", ETH_ALEN},
-	    {"veth0_macvtap", ETH_ALEN},
-	    {"veth1_macvtap", ETH_ALEN},
-	    {"macvtap0", ETH_ALEN},
-	    {"macsec0", ETH_ALEN},
-	    {"veth0_to_batadv", ETH_ALEN},
-	    {"veth1_to_batadv", ETH_ALEN},
-	    {"batadv_slave_0", ETH_ALEN},
-	    {"batadv_slave_1", ETH_ALEN},
-	    {"geneve0", ETH_ALEN},
-	    {"geneve1", ETH_ALEN},
-	    {"wg0", 0},
-	    {"wg1", 0},
-	    {"wg2", 0},
+		{"lo", ETH_ALEN},
+		{"sit0", 0},
+		{"bridge0", ETH_ALEN},
+		{"vcan0", 0, true},
+		{"tunl0", 0},
+		{"gre0", 0},
+		{"gretap0", ETH_ALEN},
+		{"ip_vti0", 0},
+		{"ip6_vti0", 0},
+		{"ip6tnl0", 0},
+		{"ip6gre0", 0},
+		{"ip6gretap0", ETH_ALEN},
+		{"erspan0", ETH_ALEN},
+		{"bond0", ETH_ALEN},
+		{"veth0", ETH_ALEN},
+		{"veth1", ETH_ALEN},
+		{"team0", ETH_ALEN},
+		{"veth0_to_bridge", ETH_ALEN},
+		{"veth1_to_bridge", ETH_ALEN},
+		{"veth0_to_bond", ETH_ALEN},
+		{"veth1_to_bond", ETH_ALEN},
+		{"veth0_to_team", ETH_ALEN},
+		{"veth1_to_team", ETH_ALEN},
+		{"veth0_to_hsr", ETH_ALEN},
+		{"veth1_to_hsr", ETH_ALEN},
+		{"hsr0", 0},
+		{"dummy0", ETH_ALEN},
+#if SYZ_EXECUTOR || SYZ_NIC_VF
+		{"nicvf0", 0, true},
+#endif
+		{"nlmon0", 0},
+		{"vxcan0", 0, true},
+		{"vxcan1", 0, true},
+		{"caif0", ETH_ALEN},
+		{"batadv0", ETH_ALEN},
+		{netdevsim, ETH_ALEN},
+		{"xfrm0", ETH_ALEN},
+		{"veth0_virt_wifi", ETH_ALEN},
+		{"veth1_virt_wifi", ETH_ALEN},
+		{"virt_wifi0", ETH_ALEN},
+		{"veth0_vlan", ETH_ALEN},
+		{"veth1_vlan", ETH_ALEN},
+		{"vlan0", ETH_ALEN},
+		{"vlan1", ETH_ALEN},
+		{"macvlan0", ETH_ALEN},
+		{"macvlan1", ETH_ALEN},
+		{"ipvlan0", ETH_ALEN},
+		{"ipvlan1", ETH_ALEN},
+		{"veth0_macvtap", ETH_ALEN},
+		{"veth1_macvtap", ETH_ALEN},
+		{"macvtap0", ETH_ALEN},
+		{"macsec0", ETH_ALEN},
+		{"veth0_to_batadv", ETH_ALEN},
+		{"veth1_to_batadv", ETH_ALEN},
+		{"batadv_slave_0", ETH_ALEN},
+		{"batadv_slave_1", ETH_ALEN},
+		{"geneve0", ETH_ALEN},
+		{"geneve1", ETH_ALEN},
+		{"wg0", 0},
+		{"wg1", 0},
+		{"wg2", 0},
 	};
 	int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
 	if (sock == -1)
@@ -3672,6 +3849,7 @@ static void initialize_netdevices(void)
 		netlink_device_change(&nlmsg, sock, slave0, false, master, 0, 0, NULL);
 		netlink_device_change(&nlmsg, sock, slave1, false, master, 0, 0, NULL);
 	}
+	netlink_add_xfrm(&nlmsg, sock, "xfrm0");
 	netlink_device_change(&nlmsg, sock, "bridge_slave_0", true, 0, 0, 0, NULL);
 	netlink_device_change(&nlmsg, sock, "bridge_slave_1", true, 0, 0, 0, NULL);
 	netlink_add_veth(&nlmsg, sock, "hsr_slave_0", "veth0_to_hsr");
@@ -3709,6 +3887,10 @@ static void initialize_netdevices(void)
 	netdevsim_add((int)procid, 4);
 
 	netlink_wireguard_setup();
+
+#if SYZ_EXECUTOR || SYZ_NIC_VF
+	netlink_nicvf_setup();
+#endif
 
 	for (i = 0; i < sizeof(devices) / (sizeof(devices[0])); i++) {
 		char addr[32];
@@ -3757,6 +3939,10 @@ static void initialize_netdevices_init(void)
 		netlink_device_change(&nlmsg, sock, dev, !devtypes[i].noup, 0, &macaddr, macsize, NULL);
 	}
 	close(sock);
+
+#if SYZ_EXECUTOR || SYZ_NIC_VF
+	find_vf_interface();
+#endif
 }
 #endif
 
@@ -6118,32 +6304,9 @@ struct fs_image_segment {
 	uintptr_t size;
 	uintptr_t offset;
 };
-
-#define IMAGE_MAX_SEGMENTS 4096
-#define IMAGE_MAX_SIZE (129 << 20)
-
-static unsigned long fs_image_segment_check(unsigned long size, unsigned long nsegs, struct fs_image_segment* segs)
-{
-	if (nsegs > IMAGE_MAX_SEGMENTS)
-		nsegs = IMAGE_MAX_SEGMENTS;
-	for (size_t i = 0; i < nsegs; i++) {
-		if (segs[i].size > IMAGE_MAX_SIZE)
-			segs[i].size = IMAGE_MAX_SIZE;
-		segs[i].offset %= IMAGE_MAX_SIZE;
-		if (segs[i].offset > IMAGE_MAX_SIZE - segs[i].size)
-			segs[i].offset = IMAGE_MAX_SIZE - segs[i].size;
-		if (size < segs[i].offset + segs[i].offset)
-			size = segs[i].offset + segs[i].offset;
-	}
-	if (size > IMAGE_MAX_SIZE)
-		size = IMAGE_MAX_SIZE;
-	return size;
-}
 static int setup_loop_device(long unsigned size, long unsigned nsegs, struct fs_image_segment* segs, const char* loopname, int* memfd_p, int* loopfd_p)
 {
 	int err = 0, loopfd = -1;
-
-	size = fs_image_segment_check(size, nsegs, segs);
 	int memfd = syscall(__NR_memfd_create, "syzkaller", 0);
 	if (memfd == -1) {
 		err = errno;
@@ -6240,7 +6403,7 @@ error_clear_loop:
 #include <stddef.h>
 #include <string.h>
 #include <sys/mount.h>
-static long syz_mount_image(volatile long fsarg, volatile long dir, volatile unsigned long size, volatile unsigned long nsegs, volatile long segments, volatile long flags, volatile long optsarg)
+static long syz_mount_image(volatile long fsarg, volatile long dir, volatile unsigned long size, volatile unsigned long nsegs, volatile long segments, volatile long flags, volatile long optsarg, volatile long change_dir)
 {
 	struct fs_image_segment* segs = (struct fs_image_segment*)segments;
 	int res = -1, err = 0, loopfd = -1, memfd = -1, need_loop_device = !!segs;
@@ -6287,6 +6450,14 @@ static long syz_mount_image(volatile long fsarg, volatile long dir, volatile uns
 	if (res == -1) {
 		debug("syz_mount_image > open error: %d\n", errno);
 		err = errno;
+		goto error_clear_loop;
+	}
+	if (change_dir) {
+		res = chdir(target);
+		if (res == -1) {
+			debug("syz_mount_image > chdir error: %d\n", errno);
+			err = errno;
+		}
 	}
 
 error_clear_loop:
@@ -8104,6 +8275,7 @@ static void mount_cgroups(const char* dir, const char** controllers, int count)
 {
 	if (mkdir(dir, 0777)) {
 		debug("mkdir(%s) failed: %d\n", dir, errno);
+		return;
 	}
 	char enabled[128] = {0};
 	int i = 0;
@@ -8116,14 +8288,45 @@ static void mount_cgroups(const char* dir, const char** controllers, int count)
 		strcat(enabled, ",");
 		strcat(enabled, controllers[i]);
 	}
-	if (enabled[0] == 0)
+	if (enabled[0] == 0) {
+		if (rmdir(dir) && errno != EBUSY)
+			failmsg("rmdir failed", "dir=%s", dir);
 		return;
+	}
 	if (mount("none", dir, "cgroup", 0, enabled + 1)) {
 		debug("mount(%s, %s) failed: %d\n", dir, enabled + 1, errno);
+		if (rmdir(dir) && errno != EBUSY)
+			failmsg("rmdir failed", "dir=%s enabled=%s", dir, enabled);
 	}
 	if (chmod(dir, 0777)) {
 		debug("chmod(%s) failed: %d\n", dir, errno);
 	}
+}
+
+static void mount_cgroups2(const char** controllers, int count)
+{
+	if (mkdir("/syzcgroup/unified", 0777)) {
+		debug("mkdir(/syzcgroup/unified) failed: %d\n", errno);
+		return;
+	}
+	if (mount("none", "/syzcgroup/unified", "cgroup2", 0, NULL)) {
+		debug("mount(cgroup2) failed: %d\n", errno);
+		if (rmdir("/syzcgroup/unified") && errno != EBUSY)
+			fail("rmdir(/syzcgroup/unified) failed");
+		return;
+	}
+	if (chmod("/syzcgroup/unified", 0777)) {
+		debug("chmod(/syzcgroup/unified) failed: %d\n", errno);
+	}
+	int control = open("/syzcgroup/unified/cgroup.subtree_control", O_WRONLY);
+	if (control == -1)
+		return;
+	int i;
+	for (i = 0; i < count; i++)
+		if (write(control, controllers[i], strlen(controllers[i])) < 0) {
+			debug("write(cgroup.subtree_control, %s) failed: %d\n", controllers[i], errno);
+		}
+	close(control);
 }
 
 static void setup_cgroups()
@@ -8133,25 +8336,9 @@ static void setup_cgroups()
 	const char* cpu_controllers[] = {"cpuset", "cpuacct", "hugetlb", "rlimit"};
 	if (mkdir("/syzcgroup", 0777)) {
 		debug("mkdir(/syzcgroup) failed: %d\n", errno);
+		return;
 	}
-	if (mkdir("/syzcgroup/unified", 0777)) {
-		debug("mkdir(/syzcgroup/unified) failed: %d\n", errno);
-	}
-	if (mount("none", "/syzcgroup/unified", "cgroup2", 0, NULL)) {
-		debug("mount(cgroup2) failed: %d\n", errno);
-	}
-	if (chmod("/syzcgroup/unified", 0777)) {
-		debug("chmod(/syzcgroup/unified) failed: %d\n", errno);
-	}
-	int unified_control = open("/syzcgroup/unified/cgroup.subtree_control", O_WRONLY);
-	if (unified_control != -1) {
-		unsigned i;
-		for (i = 0; i < sizeof(unified_controllers) / sizeof(unified_controllers[0]); i++)
-			if (write(unified_control, unified_controllers[i], strlen(unified_controllers[i])) < 0) {
-				debug("write(cgroup.subtree_control, %s) failed: %d\n", unified_controllers[i], errno);
-			}
-		close(unified_control);
-	}
+	mount_cgroups2(unified_controllers, sizeof(unified_controllers) / sizeof(unified_controllers[0]));
 	mount_cgroups("/syzcgroup/net", net_controllers, sizeof(net_controllers) / sizeof(net_controllers[0]));
 	mount_cgroups("/syzcgroup/cpu", cpu_controllers, sizeof(cpu_controllers) / sizeof(cpu_controllers[0]));
 	write_file("/syzcgroup/cpu/cgroup.clone_children", "1");
@@ -8411,6 +8598,7 @@ static int do_sandbox_none(void)
 	if (unshare(CLONE_NEWNET)) {
 		debug("unshare(CLONE_NEWNET): %d\n", errno);
 	}
+	write_file("/proc/sys/net/ipv4/ping_group_range", "0 65535");
 #if SYZ_EXECUTOR || SYZ_DEVLINK_PCI
 	initialize_devlink_pci();
 #endif
@@ -8507,6 +8695,7 @@ static int namespace_sandbox_proc(void* arg)
 #endif
 	if (unshare(CLONE_NEWNET))
 		fail("unshare(CLONE_NEWNET)");
+	write_file("/proc/sys/net/ipv4/ping_group_range", "0 65535");
 #if SYZ_EXECUTOR || SYZ_DEVLINK_PCI
 	initialize_devlink_pci();
 #endif
@@ -8681,6 +8870,61 @@ BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 
 static const struct sock_filter* primary_app_filter = arm64_app_filter;
 static const size_t primary_app_filter_size = arm64_app_filter_size;
+
+const struct sock_filter arm64_system_filter[] = {
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 46),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 98, 44, 0),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 29, 43, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 226, 21, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 101, 11, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 30, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 19, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 18, 38, 37),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 29, 37, 36),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 42, 36, 35),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 99, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 59, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 33, 32),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 98, 32, 31),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 100, 31, 30),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 203, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 198, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 105, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 104, 27, 26),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 180, 26, 25),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 202, 25, 24),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 220, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 217, 23, 22),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 224, 22, 21),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 424, 11, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 266, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 260, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 240, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 234, 17, 16),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 244, 16, 15),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 262, 15, 14),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 291, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 274, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 272, 12, 11),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 288, 11, 10),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 292, 10, 9),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 6, 5),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 5, 4),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 4, 3),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
+BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+};
+
+#define arm64_system_filter_size (sizeof(arm64_system_filter) / sizeof(struct sock_filter))
+
+static const struct sock_filter* system_filter = arm64_system_filter;
+static const size_t system_filter_size = arm64_system_filter_size;
 #define kFilterMaxSize (arm64_app_filter_size + 3 + 1 + 4 + 2)
 
 #elif GOARCH_arm
@@ -8840,12 +9084,163 @@ BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 
 static const struct sock_filter* primary_app_filter = arm_app_filter;
 static const size_t primary_app_filter_size = arm_app_filter_size;
+
+const struct sock_filter arm_system_filter[] = {
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 142),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 240, 140, 0),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 54, 139, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 197, 69, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 91, 35, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 51, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 36, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 19, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 11, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 3, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 2, 132, 131),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 7, 131, 130),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 13, 130, 129),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 26, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 22, 128, 127),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 27, 127, 126),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 41, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 38, 124, 123),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 42, 123, 122),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 45, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 121, 120),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 46, 120, 119),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 74, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 64, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 60, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 53, 115, 114),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 114, 113),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 62, 113, 112),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 66, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 65, 111, 110),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 68, 110, 109),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 85, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 77, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 76, 107, 106),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 80, 106, 105),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 88, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 86, 104, 103),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 89, 103, 102),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 131, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 116, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 103, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 96, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 97, 96),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 96, 95),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 98, 95, 94),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 114, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 107, 93, 92),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 115, 92, 91),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 124, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 118, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 117, 89, 88),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 123, 88, 87),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 128, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 126, 86, 85),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 130, 85, 84),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 150, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 138, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 134, 81, 80),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 80, 79),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 143, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 141, 78, 77),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 149, 77, 76),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 183, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 172, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 164, 74, 73),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 182, 73, 72),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 190, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 188, 71, 70),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 196, 70, 69),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 345, 35, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 270, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 224, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 217, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 213, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 199, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 198, 63, 62),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 212, 62, 61),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 215, 61, 60),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 219, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 218, 59, 58),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 222, 58, 57),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 251, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 241, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 240, 55, 54),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 249, 54, 53),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 252, 52, 51),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 269, 51, 50),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 317, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 290, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 286, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 280, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 271, 46, 45),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 45, 44),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 289, 44, 43),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 292, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 291, 42, 41),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 298, 41, 40),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 327, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 322, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 319, 38, 37),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 326, 37, 36),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 340, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 339, 35, 34),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 344, 34, 33),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 417, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 372, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 352, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 350, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 348, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 347, 28, 27),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 349, 27, 26),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 351, 26, 25),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 369, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 367, 24, 23),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 370, 23, 22),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 397, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 380, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 378, 20, 19),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 394, 19, 18),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 403, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 398, 17, 16),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 415, 16, 15),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 420, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 418, 12, 11),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 11, 10),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 9, 8),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 8, 7),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 983042, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 5, 4),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 4, 3),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 983045, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 983043, 2, 1),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 983046, 1, 0),
+BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+};
+
+#define arm_system_filter_size (sizeof(arm_system_filter) / sizeof(struct sock_filter))
+
+static const struct sock_filter* system_filter = arm_system_filter;
+static const size_t system_filter_size = arm_system_filter_size;
 #define kFilterMaxSize (arm_app_filter_size + 3 + 1 + 4 + 2)
 
 #elif GOARCH_amd64
 #define PRIMARY_ARCH AUDIT_ARCH_X86_64
 
-const sock_filter x86_64_app_filter[] = {
+const struct sock_filter x86_64_app_filter[] = {
 BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 114),
 BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 202, 112, 0),
 BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 16, 111, 0),
@@ -8967,6 +9362,115 @@ BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 
 static const struct sock_filter* primary_app_filter = x86_64_app_filter;
 static const size_t primary_app_filter_size = x86_64_app_filter_size;
+
+const struct sock_filter x86_64_system_filter[] = {
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 100),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 202, 98, 0),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 16, 97, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 203, 49, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 25, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 13, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 32, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 17, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 8, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 6, 91, 90),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 16, 90, 89),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 24, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 21, 88, 87),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 29, 87, 86),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 38, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 35, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 33, 84, 83),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 37, 83, 82),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 82, 81),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 79, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 72, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 78, 77),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 64, 77, 76),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 78, 76, 75),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 91, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 89, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 82, 73, 72),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 90, 72, 71),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 92, 71, 70),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 155, 11, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 135, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 112, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 66, 65),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 111, 65, 64),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 132, 64, 63),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 140, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 61, 60),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 139, 60, 59),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 153, 59, 58),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 175, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 169, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 157, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 156, 55, 54),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 167, 54, 53),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 172, 53, 52),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 186, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 179, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 177, 50, 49),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 180, 49, 48),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 201, 48, 47),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 283, 23, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 251, 11, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 221, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 217, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 206, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 205, 42, 41),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 211, 41, 40),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 220, 40, 39),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 247, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 233, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 232, 37, 36),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 235, 36, 35),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 248, 35, 34),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 262, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 257, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 254, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 253, 31, 30),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 30, 29),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 261, 29, 28),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 280, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 275, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 274, 26, 25),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 279, 25, 24),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 282, 24, 23),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 332, 11, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 305, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 302, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 284, 19, 18),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 300, 18, 17),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 303, 17, 16),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 321, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 314, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 312, 14, 13),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 320, 13, 12),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 329, 12, 11),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 424, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 333, 8, 7),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 7, 6),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 6, 5),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 3, 2),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
+BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+};
+
+#define x86_64_system_filter_size (sizeof(x86_64_system_filter) / sizeof(struct sock_filter))
+
+static const struct sock_filter* system_filter = x86_64_system_filter;
+static const size_t system_filter_size = x86_64_system_filter_size;
 #define kFilterMaxSize (x86_64_app_filter_size + 3 + 1 + 4 + 2)
 
 #elif GOARCH_386
@@ -9120,6 +9624,151 @@ BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
 
 static const struct sock_filter* primary_app_filter = x86_app_filter;
 static const size_t primary_app_filter_size = x86_app_filter_size;
+
+const struct sock_filter x86_system_filter[] = {
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 0, 0, 136),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 240, 134, 0),
+BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K, 54, 133, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 190, 67, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 88, 33, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 51, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 36, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 19, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 11, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 3, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 2, 126, 125),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 7, 125, 124),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 13, 124, 123),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 26, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 22, 122, 121),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 27, 121, 120),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 43, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 41, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 38, 118, 117),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 42, 117, 116),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 45, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 44, 115, 114),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 46, 114, 113),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 66, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 60, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 57, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 53, 110, 109),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 58, 109, 108),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 64, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 62, 107, 106),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 65, 106, 105),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 77, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 74, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 68, 103, 102),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 76, 102, 101),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 85, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 80, 100, 99),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 86, 99, 98),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 128, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 114, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 96, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 94, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 91, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 89, 93, 92),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 93, 92, 91),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 95, 91, 90),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 102, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 98, 89, 88),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 107, 88, 87),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 118, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 116, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 115, 85, 84),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 117, 84, 83),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 124, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 123, 82, 81),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 126, 81, 80),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 143, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 136, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 131, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 130, 77, 76),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 134, 76, 75),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 138, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 137, 74, 73),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 141, 73, 72),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 172, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 150, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 149, 70, 69),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 164, 69, 68),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 183, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 182, 67, 66),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 188, 66, 65),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 318, 33, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 255, 17, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 224, 9, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 213, 5, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 199, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 197, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 196, 59, 58),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 198, 58, 57),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 212, 57, 56),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 218, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 215, 55, 54),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 222, 54, 53),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 245, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 241, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 240, 51, 50),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 244, 50, 49),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 252, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 250, 48, 47),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 253, 47, 46),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 292, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 272, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 258, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 256, 43, 42),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 271, 42, 41),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 284, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 273, 40, 39),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 285, 39, 38),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 300, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 295, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 294, 36, 35),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 299, 35, 34),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 313, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 312, 33, 32),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 317, 32, 31),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 383, 15, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 343, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 324, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 322, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 321, 27, 26),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 323, 26, 25),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 340, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 337, 24, 23),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 341, 23, 22),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 351, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 346, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 345, 20, 19),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 349, 19, 18),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 374, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 359, 17, 16),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 380, 16, 15),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 434, 7, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 417, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 403, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 384, 12, 11),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 415, 11, 10),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 420, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 418, 9, 8),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 425, 8, 7),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 438, 3, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 436, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 435, 5, 4),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 437, 4, 3),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 440, 1, 0),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 439, 2, 1),
+BPF_JUMP(BPF_JMP|BPF_JGE|BPF_K, 441, 1, 0),
+BPF_STMT(BPF_RET|BPF_K, SECCOMP_RET_ALLOW),
+};
+
+#define x86_system_filter_size (sizeof(x86_system_filter) / sizeof(struct sock_filter))
+
+static const struct sock_filter* system_filter = x86_system_filter;
+static const size_t system_filter_size = x86_system_filter_size;
 #define kFilterMaxSize (x86_app_filter_size + 3 + 1 + 4 + 2)
 
 #else
@@ -9170,20 +9819,31 @@ static void install_filter(const Filter* f)
 	if (prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog) < 0)
 		failmsg("could not set seccomp filter", "size=%zu", f->count);
 }
-static void set_app_seccomp_filter()
+static void set_seccomp_filter(const struct sock_filter* filter, size_t size)
 {
-	const struct sock_filter* p = primary_app_filter;
-	size_t p_size = primary_app_filter_size;
-
 	Filter f;
 	f.count = 0;
 	ValidateArchitecture(&f);
 	ExamineSyscall(&f);
 
-	for (size_t i = 0; i < p_size; ++i)
-		push_back(&f, p[i]);
+	for (size_t i = 0; i < size; ++i)
+		push_back(&f, filter[i]);
 	Disallow(&f);
 	install_filter(&f);
+}
+
+enum {
+	SCFS_RestrictedApp,
+	SCFS_SystemAccount
+};
+
+static void set_app_seccomp_filter(int account)
+{
+	if (account == SCFS_SystemAccount) {
+		set_seccomp_filter(system_filter, system_filter_size);
+	} else {
+		set_seccomp_filter(primary_app_filter, primary_app_filter_size);
+	}
 }
 
 
@@ -9218,6 +9878,9 @@ inline int symlink(const char* old_path, const char* new_path)
 #define UNTRUSTED_APP_UID (AID_APP + 999)
 #define UNTRUSTED_APP_GID (AID_APP + 999)
 
+#define SYSTEM_UID 1000
+#define SYSTEM_GID 1000
+
 const char* const SELINUX_CONTEXT_UNTRUSTED_APP = "u:r:untrusted_app:s0:c512,c768";
 const char* const SELINUX_LABEL_APP_DATA_FILE = "u:object_r:app_data_file:s0:c512,c768";
 const char* const SELINUX_CONTEXT_FILE = "/proc/thread-self/attr/current";
@@ -9225,6 +9888,9 @@ const char* const SELINUX_XATTR_NAME = "security.selinux";
 
 const gid_t UNTRUSTED_APP_GROUPS[] = {UNTRUSTED_APP_GID, AID_NET_BT_ADMIN, AID_NET_BT, AID_INET, AID_EVERYBODY};
 const size_t UNTRUSTED_APP_NUM_GROUPS = sizeof(UNTRUSTED_APP_GROUPS) / sizeof(UNTRUSTED_APP_GROUPS[0]);
+
+const gid_t SYSTEM_GROUPS[] = {SYSTEM_GID, AID_NET_BT_ADMIN, AID_NET_BT, AID_INET, AID_EVERYBODY};
+const size_t SYSTEM_NUM_GROUPS = sizeof(SYSTEM_GROUPS) / sizeof(SYSTEM_GROUPS[0]);
 static void getcon(char* context, size_t context_size)
 {
 	int fd = open(SELINUX_CONTEXT_FILE, O_RDONLY);
@@ -9271,7 +9937,8 @@ static void setfilecon(const char* path, const char* context)
 }
 
 #define SYZ_HAVE_SANDBOX_ANDROID 1
-static int do_sandbox_android(void)
+
+static int do_sandbox_android(uint64 sandbox_arg)
 {
 	setup_common();
 #if SYZ_EXECUTOR || SYZ_VHCI_INJECTION
@@ -9292,28 +9959,44 @@ static int do_sandbox_android(void)
 #if SYZ_EXECUTOR || SYZ_NET_DEVICES
 	initialize_netdevices();
 #endif
+	uid_t uid = UNTRUSTED_APP_UID;
+	size_t num_groups = UNTRUSTED_APP_NUM_GROUPS;
+	const gid_t* groups = UNTRUSTED_APP_GROUPS;
+	gid_t gid = UNTRUSTED_APP_GID;
+	debug("executor received sandbox_arg=%llu\n", sandbox_arg);
+	if (sandbox_arg == 1) {
+		uid = SYSTEM_UID;
+		num_groups = SYSTEM_NUM_GROUPS;
+		groups = SYSTEM_GROUPS;
+		gid = SYSTEM_GID;
 
-	if (chown(".", UNTRUSTED_APP_UID, UNTRUSTED_APP_UID) != 0)
-		fail("do_sandbox_android: chmod failed");
+		debug("fuzzing under SYSTEM account\n");
+	}
+	if (chown(".", uid, uid) != 0)
+		failmsg("do_sandbox_android: chmod failed", "sandbox_arg=%llu", sandbox_arg);
 
-	if (setgroups(UNTRUSTED_APP_NUM_GROUPS, UNTRUSTED_APP_GROUPS) != 0)
-		fail("do_sandbox_android: setgroups failed");
+	if (setgroups(num_groups, groups) != 0)
+		failmsg("do_sandbox_android: setgroups failed", "sandbox_arg=%llu", sandbox_arg);
 
-	if (setresgid(UNTRUSTED_APP_GID, UNTRUSTED_APP_GID, UNTRUSTED_APP_GID) != 0)
-		fail("do_sandbox_android: setresgid failed");
+	if (setresgid(gid, gid, gid) != 0)
+		failmsg("do_sandbox_android: setresgid failed", "sandbox_arg=%llu", sandbox_arg);
 
 	setup_binderfs();
 
 #if GOARCH_arm || GOARCH_arm64 || GOARCH_386 || GOARCH_amd64
-	set_app_seccomp_filter();
+	int account = SCFS_RestrictedApp;
+	if (sandbox_arg == 1)
+		account = SCFS_SystemAccount;
+	set_app_seccomp_filter(account);
 #endif
 
-	if (setresuid(UNTRUSTED_APP_UID, UNTRUSTED_APP_UID, UNTRUSTED_APP_UID) != 0)
-		fail("do_sandbox_android: setresuid failed");
+	if (setresuid(uid, uid, uid) != 0)
+		failmsg("do_sandbox_android: setresuid failed", "sandbox_arg=%llu", sandbox_arg);
 	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
 
 	setfilecon(".", SELINUX_LABEL_APP_DATA_FILE);
-	setcon(SELINUX_CONTEXT_UNTRUSTED_APP);
+	if (uid == UNTRUSTED_APP_UID)
+		setcon(SELINUX_CONTEXT_UNTRUSTED_APP);
 
 	loop();
 	doexit(1);
@@ -9806,7 +10489,6 @@ static void setup_sysctl()
 		{"/proc/sys/vm/oom_dump_tasks", "0"},
 		{"/proc/sys/debug/exception-trace", "0"},
 		{"/proc/sys/kernel/printk", "7 4 1 3"},
-		{"/proc/sys/net/ipv4/ping_group_range", "0 65535"},
 		{"/proc/sys/kernel/keys/gc_delay", "1"},
 		{"/proc/sys/vm/oom_kill_allocating_task", "1"},
 		{"/proc/sys/kernel/ctrl-alt-del", "0"},
@@ -9856,7 +10538,7 @@ static void setup_802154()
 		}
 		netlink_device_change(&nlmsg, sock_route, devname, true, 0, &hwaddr, sizeof(hwaddr), 0);
 		if (i == 0) {
-			netlink_add_device_impl(&nlmsg, "lowpan", "lowpan0");
+			netlink_add_device_impl(&nlmsg, "lowpan", "lowpan0", false);
 			netlink_done(&nlmsg);
 			netlink_attr(&nlmsg, IFLA_LINK, &ifindex, sizeof(ifindex));
 			int err = netlink_send(&nlmsg, sock_route);

@@ -412,10 +412,11 @@ func (jp *JobProcessor) bisect(job *Job, mgrcfg *mgrconfig.Config) error {
 		// compete with patch testing jobs (it's bad delaying patch testing).
 		// When/if bisection jobs don't compete with patch testing,
 		// it makes sense to increase this to 12-24h.
-		Timeout: 8 * time.Hour,
-		Fix:     req.Type == dashapi.JobBisectFix,
-		BinDir:  jp.cfg.BisectBinDir,
-		Ccache:  jp.cfg.Ccache,
+		Timeout:        8 * time.Hour,
+		Fix:            req.Type == dashapi.JobBisectFix,
+		BisectCompiler: mgr.mgrcfg.BisectCompiler,
+		BinDir:         jp.cfg.BisectBinDir,
+		Ccache:         jp.cfg.Ccache,
 		Kernel: bisect.KernelConfig{
 			Repo:           mgr.mgrcfg.Repo,
 			Branch:         mgr.mgrcfg.Branch,
@@ -477,6 +478,7 @@ func (jp *JobProcessor) bisect(job *Job, mgrcfg *mgrconfig.Config) error {
 	}
 	if res.Report != nil {
 		resp.CrashTitle = res.Report.Title
+		resp.CrashAltTitles = res.Report.AltTitles
 		resp.CrashReport = res.Report.Report
 		resp.CrashLog = res.Report.Output
 		if len(resp.Commits) != 0 {
@@ -499,10 +501,10 @@ func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 		return err
 	}
 	log.Logf(0, "job: building syzkaller on %v...", req.SyzkallerCommit)
-	if err := env.BuildSyzkaller(jp.syzkallerRepo, req.SyzkallerCommit); err != nil {
-		return err
+	syzBuildLog, syzBuildErr := env.BuildSyzkaller(jp.syzkallerRepo, req.SyzkallerCommit)
+	if syzBuildErr != nil {
+		return syzBuildErr
 	}
-
 	log.Logf(0, "job: fetching kernel...")
 	repo, err := vcs.NewRepo(mgrcfg.TargetOS, mgrcfg.Type, mgrcfg.KernelSrc)
 	if err != nil {
@@ -563,15 +565,16 @@ func (jp *JobProcessor) testPatch(job *Job, mgrcfg *mgrconfig.Config) error {
 	log.Logf(0, "job: testing...")
 	results, err := env.Test(3, req.ReproSyz, req.ReproOpts, req.ReproC)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w\n\nsyzkaller build log:\n%s", err, syzBuildLog)
 	}
 	ret, err := aggregateTestResults(results)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w\n\nsyzkaller build log:\n%s", err, syzBuildLog)
 	}
 	rep := ret.report
 	if rep != nil {
 		resp.CrashTitle = rep.Title
+		resp.CrashAltTitles = rep.AltTitles
 		resp.CrashReport = rep.Report
 	}
 	resp.CrashLog = ret.rawOutput

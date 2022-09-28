@@ -350,14 +350,15 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 			<td class="config">{{if $b.KernelConfigLink}}<a href="{{$b.KernelConfigLink}}">.config</a>{{end}}</td>
 			<td class="repro">{{if $b.LogLink}}<a href="{{$b.LogLink}}">log</a>{{end}}</td>
 			<td class="repro">{{if $b.ReportLink}}<a href="{{$b.ReportLink}}">report</a>{{end}}</td>
-			<td class="repro">{{if $b.ReproSyzLink}}<a href="{{$b.ReproSyzLink}}">syz</a>{{end}}</td>
-			<td class="repro">{{if $b.ReproCLink}}<a href="{{$b.ReproCLink}}">C</a>{{end}}</td>
+			<td class="repro{{if $b.ReproIsRevoked}} stale_repro{{end}}">{{if $b.ReproSyzLink}}<a href="{{$b.ReproSyzLink}}">syz</a>{{end}}</td>
+			<td class="repro {{if $b.ReproIsRevoked}} stale_repro{{end}}">{{if $b.ReproCLink}}<a href="{{$b.ReproCLink}}">C</a>{{end}}</td>
 			<td class="repro">{{if $b.MachineInfoLink}}<a href="{{$b.MachineInfoLink}}">info</a>{{end}}</td>
 			<td class="manager">{{$b.Title}}</td>
 		</tr>
 		{{end}}
 		</tbody>
 </table>
+<i>* <s>Struck through</s> repros no longer work on HEAD.</i>
 {{end}}
 {{end}}
 
@@ -404,17 +405,19 @@ Use of this source code is governed by Apache 2 LICENSE that can be found in the
 					{{if $job.ErrorLink}}
 						{{link $job.ErrorLink "error"}}
 					{{else if $job.LogLink}}
-						{{link $job.LogLink "log"}}
+						{{link $job.LogLink "job log"}}
 						({{if $job.Commit}}1{{else}}{{len $job.Commits}}{{end}})
 					{{else if $job.CrashTitle}}
 						{{optlink $job.CrashReportLink "report"}}
-						{{optlink $job.CrashLogLink "log"}}
 					{{else if formatTime $job.Finished}}
 						OK
 					{{else if formatTime $job.Started}}
 						running
 					{{else}}
 						pending
+					{{end}}
+					{{if $job.CrashLogLink}}
+						{{optlink $job.CrashLogLink "log"}}
 					{{end}}
 				</td>
 			</tr>

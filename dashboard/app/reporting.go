@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
+	"github.com/google/syzkaller/pkg/asset"
 	"github.com/google/syzkaller/pkg/email"
 	"github.com/google/syzkaller/pkg/html"
 	"github.com/google/syzkaller/sys/targets"
@@ -74,9 +75,15 @@ func reportingPollBugs(c context.Context, typ string) []*dashapi.BugReport {
 
 func handleReportBug(c context.Context, typ string, state *ReportingState, bug *Bug) (
 	*dashapi.BugReport, error) {
-	reporting, bugReporting, crash, crashKey, _, _, _, err := needReport(c, typ, state, bug)
+	reporting, bugReporting, _, _, _, err := needReport(c, typ, state, bug)
 	if err != nil || reporting == nil {
 		return nil, err
+	}
+	crash, crashKey, err := findCrashForBug(c, bug)
+	if err != nil {
+		return nil, err
+	} else if crash == nil {
+		return nil, fmt.Errorf("no crashes")
 	}
 	rep, err := createBugReport(c, bug, crash, crashKey, bugReporting, reporting)
 	if err != nil {
@@ -87,8 +94,8 @@ func handleReportBug(c context.Context, typ string, state *ReportingState, bug *
 }
 
 func needReport(c context.Context, typ string, state *ReportingState, bug *Bug) (
-	reporting *Reporting, bugReporting *BugReporting, crash *Crash,
-	crashKey *db.Key, reportingIdx int, status, link string, err error) {
+	reporting *Reporting, bugReporting *BugReporting, reportingIdx int,
+	status, link string, err error) {
 	reporting, bugReporting, reportingIdx, status, err = currentReporting(c, bug)
 	if err != nil || reporting == nil {
 		return
@@ -123,9 +130,7 @@ func needReport(c context.Context, typ string, state *ReportingState, bug *Bug) 
 		reporting, bugReporting = nil, nil
 		return
 	}
-
-	crash, crashKey, err = findCrashForBug(c, bug)
-	if err != nil {
+	if bug.NumCrashes == 0 {
 		status = fmt.Sprintf("%v: no crashes!", reporting.DisplayTitle)
 		reporting, bugReporting = nil, nil
 		return
@@ -192,7 +197,6 @@ func handleReportNotif(c context.Context, typ string, bug *Bug) (*dashapi.BugNot
 	if bug.Status != BugStatusOpen || bugReporting.Reported.IsZero() {
 		return nil, nil
 	}
-
 	if reporting.moderation &&
 		reporting.Embargo != 0 &&
 		len(bug.Commits) == 0 &&
@@ -209,11 +213,12 @@ func handleReportNotif(c context.Context, typ string, bug *Bug) (*dashapi.BugNot
 		return createNotification(c, dashapi.BugNotifUpstream, true, "", bug, reporting, bugReporting)
 	}
 	if len(bug.Commits) == 0 &&
-		bug.wontBeFixBisected() &&
+		bug.canBeObsoleted() &&
 		timeSince(c, bug.LastActivity) > notifyResendPeriod &&
 		timeSince(c, bug.LastTime) > bug.obsoletePeriod() {
 		log.Infof(c, "%v: obsoleting: %v", bug.Namespace, bug.Title)
-		return createNotification(c, dashapi.BugNotifObsoleted, false, "", bug, reporting, bugReporting)
+		why := bugObsoletionReason(bug)
+		return createNotification(c, dashapi.BugNotifObsoleted, false, string(why), bug, reporting, bugReporting)
 	}
 	if len(bug.Commits) > 0 &&
 		len(bug.PatchedOn) == 0 &&
@@ -226,14 +231,21 @@ func handleReportNotif(c context.Context, typ string, bug *Bug) (*dashapi.BugNot
 	return nil, nil
 }
 
+func bugObsoletionReason(bug *Bug) dashapi.BugStatusReason {
+	if bug.HeadReproLevel == ReproLevelNone && bug.ReproLevel != ReproLevelNone {
+		return dashapi.InvalidatedByRevokedRepro
+	}
+	return dashapi.InvalidatedByNoActivity
+}
+
 // TODO: this is what we would like to do, but we need to figure out
 // KMSAN story: we don't do fix bisection on it (rebased),
 // do we want to close all old KMSAN bugs with repros?
 // For now we only enable this in tests.
 var obsoleteWhatWontBeFixBisected = false
 
-func (bug *Bug) wontBeFixBisected() bool {
-	if bug.ReproLevel == ReproLevelNone {
+func (bug *Bug) canBeObsoleted() bool {
+	if bug.HeadReproLevel == ReproLevelNone {
 		return true
 	}
 	if obsoleteWhatWontBeFixBisected {
@@ -294,7 +306,7 @@ func createNotification(c context.Context, typ dashapi.BugNotif, public bool, te
 	}
 	crash, _, err := findCrashForBug(c, bug)
 	if err != nil {
-		return nil, fmt.Errorf("no crashes for bug")
+		return nil, err
 	}
 	build, err := loadBuild(c, bug.Namespace, crash.BuildID)
 	if err != nil {
@@ -328,6 +340,13 @@ func createNotification(c context.Context, typ dashapi.BugNotif, public bool, te
 }
 
 func currentReporting(c context.Context, bug *Bug) (*Reporting, *BugReporting, int, string, error) {
+	if bug.NumCrashes == 0 {
+		// This is possible during the short window when we already created a bug,
+		// but did not attach the first crash to it yet. We need to avoid reporting this bug yet
+		// and wait for the crash. Otherwise reporting filter may mis-classify it as e.g.
+		// not having a report or something else.
+		return nil, nil, 0, "no crashes yet", nil
+	}
 	for i := range bug.Reporting {
 		bugReporting := &bug.Reporting[i]
 		if !bugReporting.Closed.IsZero() {
@@ -366,6 +385,7 @@ func reproStr(level dashapi.ReproLevel) string {
 	}
 }
 
+// nolint: gocyclo
 func createBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key,
 	bugReporting *BugReporting, reporting *Reporting) (*dashapi.BugReport, error) {
 	reportingConfig, err := json.Marshal(reporting.Config)
@@ -422,7 +442,22 @@ func createBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key
 	if !bugReporting.Reported.IsZero() {
 		typ = dashapi.ReportRepro
 	}
-
+	assetList := []dashapi.Asset{}
+	for _, buildAsset := range build.Assets {
+		typeDescr := asset.GetTypeDescription(buildAsset.Type)
+		if typeDescr == nil || typeDescr.NoReporting {
+			continue
+		}
+		assetList = append(assetList, dashapi.Asset{
+			Title:       typeDescr.GetTitle(targets.Get(build.OS, build.Arch)),
+			DownloadURL: buildAsset.DownloadURL,
+			Type:        buildAsset.Type,
+		})
+	}
+	sort.SliceStable(assetList, func(i, j int) bool {
+		return asset.GetTypeDescription(assetList[i].Type).ReportingPrio <
+			asset.GetTypeDescription(assetList[j].Type).ReportingPrio
+	})
 	kernelRepo := kernelRepoInfo(build)
 	rep := &dashapi.BugReport{
 		Type:            typ,
@@ -448,6 +483,7 @@ func createBugReport(c context.Context, bug *Bug, crash *Crash, crashKey *db.Key
 		CrashTime:       crash.Time,
 		NumCrashes:      bug.NumCrashes,
 		HappenedOn:      managersToRepos(c, bug.Namespace, bug.HappenedOn),
+		Assets:          assetList,
 	}
 	if bugReporting.CC != "" {
 		rep.CC = append(rep.CC, strings.Split(bugReporting.CC, "|")...)
@@ -956,6 +992,9 @@ func incomingCommandCmd(c context.Context, now time.Time, cmd *dashapi.BugUpdate
 		bug.UNCC = email.MergeEmailLists(bug.UNCC, cmd.CC)
 	default:
 		return false, internalError, fmt.Errorf("unknown bug status %v", cmd.Status)
+	}
+	if cmd.StatusReason != "" {
+		bug.StatusReason = cmd.StatusReason
 	}
 	return true, "", nil
 }

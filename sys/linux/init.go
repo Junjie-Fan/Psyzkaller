@@ -54,6 +54,7 @@ func InitTarget(target *prog.Target) {
 
 	target.MakeDataMmap = targets.MakePosixMmap(target, true, true)
 	target.Neutralize = arch.neutralize
+	target.ExtractMountedImage = arch.extractSyzMountImage
 	target.SpecialTypes = map[string]func(g *prog.Gen, typ prog.Type, dir prog.Dir, old prog.Arg) (
 		prog.Arg, []*prog.Call){
 		"timespec":                  arch.generateTimespec,
@@ -96,6 +97,18 @@ func InitTarget(target *prog.Target) {
 	case targets.I386, targets.ARM64, targets.ARM, targets.PPC64LE, targets.MIPS64LE, targets.S390x:
 	default:
 		panic("unknown arch")
+	}
+
+	target.SpecialFileLenghts = []int{
+		int(target.GetConst("PATH_MAX")),
+		int(target.GetConst("UNIX_PATH_MAX")),
+		int(target.GetConst("NAME_MAX")),
+		int(target.GetConst("BTRFS_INO_LOOKUP_PATH_MAX")),
+		int(target.GetConst("BTRFS_INO_LOOKUP_USER_PATH_MAX")),
+		int(target.GetConst("SMB_PATH_MAX")),
+		int(target.GetConst("XT_CGROUP_PATH_MAX")),
+		int(target.GetConst("XENSTORE_REL_PATH_MAX")),
+		1 << 16, // gVisor's MaxFilenameLen
 	}
 
 	if target.Arch == runtime.GOARCH {
@@ -229,6 +242,8 @@ func (arch *arch) neutralize(c *prog.Call) {
 	case "sched_setattr":
 		// Enabling a SCHED_FIFO or a SCHED_RR policy may lead to false positive stall-related crashes.
 		neutralizeSchedAttr(c.Args[1])
+	case "syz_mount_image":
+		arch.fixUpSyzMountImage(c)
 	}
 
 	switch c.Meta.Name {

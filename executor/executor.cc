@@ -90,7 +90,9 @@ static NORETURN PRINTF(2, 3) void failmsg(const char* err, const char* msg, ...)
 // Just exit (e.g. due to temporal ENOMEM error).
 static NORETURN PRINTF(1, 2) void exitf(const char* msg, ...);
 static NORETURN void doexit(int status);
+#if !GOOS_fuchsia
 static NORETURN void doexit_thread(int status);
+#endif
 
 // Print debug output that is visible when running syz-manager/execprog with -debug flag.
 // Debug output is supposed to be relatively high-level (syscalls executed, return values, timing, etc)
@@ -171,6 +173,7 @@ static bool flag_net_reset;
 static bool flag_cgroups;
 static bool flag_close_fds;
 static bool flag_devlink_pci;
+static bool flag_nic_vf;
 static bool flag_vhci_injection;
 static bool flag_wifi;
 static bool flag_delay_kcov_mmap;
@@ -298,6 +301,7 @@ struct handshake_req {
 	uint64 magic;
 	uint64 flags; // env flags
 	uint64 pid;
+	uint64 sandbox_arg;
 };
 
 struct handshake_reply {
@@ -412,6 +416,10 @@ static void setup_features(char** enable, int n);
 
 #include "test.h"
 
+#if SYZ_HAVE_SANDBOX_ANDROID
+static uint64 sandbox_arg = 0;
+#endif
+
 int main(int argc, char** argv)
 {
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
@@ -525,7 +533,7 @@ int main(int argc, char** argv)
 #endif
 #if SYZ_HAVE_SANDBOX_ANDROID
 	else if (flag_sandbox_android)
-		status = do_sandbox_android();
+		status = do_sandbox_android(sandbox_arg);
 #endif
 	else
 		fail("unknown sandbox type");
@@ -614,6 +622,7 @@ void parse_env_flags(uint64 flags)
 	flag_vhci_injection = flags & (1 << 12);
 	flag_wifi = flags & (1 << 13);
 	flag_delay_kcov_mmap = flags & (1 << 14);
+	flag_nic_vf = flags & (1 << 15);
 }
 
 #if SYZ_EXECUTOR_USES_FORK_SERVER
@@ -625,6 +634,9 @@ void receive_handshake()
 		failmsg("handshake read failed", "read=%d", n);
 	if (req.magic != kInMagic)
 		failmsg("bad handshake magic", "magic=0x%llx", req.magic);
+#if SYZ_HAVE_SANDBOX_ANDROID
+	sandbox_arg = req.sandbox_arg;
+#endif
 	parse_env_flags(req.flags);
 	procid = req.pid;
 }
