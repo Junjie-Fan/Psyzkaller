@@ -150,8 +150,8 @@ func (target *Target) calcDynamicPrio(corpus []*Prog) [][]int32 {
 	}
 	for _, p := range corpus {
 		for idx0, c0 := range p.Calls {
-			for _, c1 := range p.Calls[idx0+1:] {
-				prios[c0.Meta.ID][c1.Meta.ID]++
+			for idx1, c1 := range p.Calls[idx0+1 : idx0+2] {
+				prios[c0.Meta.ID][c1.Meta.ID] += int32(2 * (1 / (idx1 - idx0)))
 			}
 		}
 	}
