@@ -70,6 +70,7 @@ func ctorLinux(cfg *config) (reporterImpl, []string, error) {
 		regexp.MustCompile(`^mm/percpu.*`),
 		regexp.MustCompile(`^mm/vmalloc.c`),
 		regexp.MustCompile(`^mm/page_alloc.c`),
+		regexp.MustCompile(`^mm/mempool.c`),
 		regexp.MustCompile(`^mm/util.c`),
 		regexp.MustCompile(`^kernel/rcu/.*`),
 		regexp.MustCompile(`^arch/.*/kernel/traps.c`),
@@ -703,27 +704,55 @@ func (ctx *linux) extractGuiltyFile(rep *Report) string {
 }
 
 func (ctx *linux) extractGuiltyFileImpl(report []byte) string {
-	first := ""
-	for s := bufio.NewScanner(bytes.NewReader(report)); s.Scan(); {
-		match := filenameRe.FindSubmatch(s.Bytes())
+	scanner := bufio.NewScanner(bytes.NewReader(report))
+
+	// Extract the first possible guilty file.
+	guilty := ""
+	for scanner.Scan() {
+		match := filenameRe.FindSubmatch(scanner.Bytes())
 		if match == nil {
 			continue
 		}
 		file := match[1]
-		if first == "" {
+		if guilty == "" {
 			// Avoid producing no guilty file at all, otherwise we mail the report to nobody.
 			// It's unclear if it's better to return the first one or the last one.
 			// So far the only test we have has only one file anyway.
-			first = string(file)
+			guilty = string(file)
 		}
 
-		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(s.Bytes()) {
+		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(scanner.Bytes()) {
 			continue
 		}
-		first = string(file)
+		guilty = string(file)
 		break
 	}
-	return filepath.Clean(first)
+	guilty = filepath.Clean(guilty)
+
+	// Search for deeper filepaths in the stack trace below the first possible guilty file.
+	deepestPath := filepath.Dir(guilty)
+	for scanner.Scan() {
+		match := filenameRe.FindSubmatch(scanner.Bytes())
+		if match == nil {
+			continue
+		}
+		file := match[1]
+		if matchesAny(file, ctx.guiltyFileIgnores) || ctx.guiltyLineIgnore.Match(scanner.Bytes()) {
+			continue
+		}
+		clean := filepath.Clean(string(file))
+
+		// Check if the new path has *both* the same directory prefix *and* a deeper suffix.
+		if strings.HasPrefix(clean, deepestPath) {
+			suffix := strings.TrimPrefix(clean, deepestPath)
+			if deeperPathRe.Match([]byte(suffix)) {
+				guilty = clean
+				deepestPath = filepath.Dir(guilty)
+			}
+		}
+	}
+
+	return guilty
 }
 
 func (ctx *linux) getMaintainers(file string) (vcs.Recipients, error) {
@@ -1068,12 +1097,8 @@ var linuxStackParams = &stackParams{
 		"atomic(64)?_(dec|inc|read|set|or|xor|and|add|sub|fetch|xchg|cmpxchg|try)",
 		"(set|clear|change|test)_bit",
 		"__wake_up",
-		"refcount_add",
-		"refcount_sub",
-		"refcount_inc",
-		"refcount_dec",
-		"refcount_set",
-		"refcount_read",
+		"^refcount_",
+		"^kref_",
 		"ref_tracker",
 		"seqprop_assert",
 		"memcpy",
@@ -1135,9 +1160,7 @@ var linuxStackParams = &stackParams{
 		"destroy_workqueue",
 		"finish_wait",
 		"kthread_stop",
-		"kobject_del",
-		"kobject_put",
-		"kobject_uevent_env",
+		"kobject_",
 		"add_uevent_var",
 		"get_device_parent",
 		"device_add",
@@ -1178,6 +1201,12 @@ var linuxStackParams = &stackParams{
 		"^crc\\d+",
 		"__might_resched",
 		"assertfail",
+		"^iput$",
+		"^iput_final$",
+		"^ihold$",
+		"hex_dump_to_buffer",
+		"print_hex_dump",
+		"^klist_",
 	},
 	corruptedLines: []*regexp.Regexp{
 		// Fault injection stacks are frequently intermixed with crash reports.
@@ -1606,9 +1635,9 @@ var linuxOopses = append([]*oops{
 				fmt:    "WARNING: still has locks held in %[1]v",
 			},
 			{
-				title:  compile("WARNING: Nested lock was not taken"),
-				report: compile("WARNING: Nested lock was not taken(?:.*\\n)+?.*at: {{FUNC}}"),
-				fmt:    "WARNING: nested lock was not taken in %[1]v",
+				title: compile("WARNING: Nested lock was not taken"),
+				fmt:   "WARNING: nested lock was not taken in %[1]v",
+				stack: warningStackFmt(),
 			},
 			{
 				title:        compile("WARNING: lock held when returning to user space"),
@@ -2031,7 +2060,6 @@ var linuxOopses = append([]*oops{
 			{
 				title: compile("kernel BUG at (.*)"),
 				fmt:   "kernel BUG in %[2]v",
-				alt:   []string{"kernel BUG at %[1]v"}, // historical title required for merging with existing bugs
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxRipFrame,

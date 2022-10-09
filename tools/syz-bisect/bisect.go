@@ -35,17 +35,19 @@ import (
 )
 
 var (
-	flagConfig          = flag.String("config", "", "bisect config file")
-	flagCrash           = flag.String("crash", "", "dir with crash info")
-	flagFix             = flag.Bool("fix", false, "search for crash fix")
-	flagKernelCommit    = flag.String("kernel_commit", "", "original kernel commit")
-	flagSyzkallerCommit = flag.String("syzkaller_commit", "", "original syzkaller commit")
+	flagConfig            = flag.String("config", "", "bisect config file")
+	flagCrash             = flag.String("crash", "", "dir with crash info")
+	flagFix               = flag.Bool("fix", false, "search for crash fix")
+	flagKernelCommit      = flag.String("kernel_commit", "", "original kernel commit")
+	flagKernelCommitTitle = flag.String("kernel_commit_title", "", "original kernel commit title")
+	flagSyzkallerCommit   = flag.String("syzkaller_commit", "", "original syzkaller commit")
 )
 
 type Config struct {
+	Compiler string `json:"compiler"`
 	// Currently either 'gcc' or 'clang'. Note that pkg/bisect requires
 	// explicit plumbing for every os/compiler combination.
-	BisectCompiler string `json:"bisect_compiler"`
+	CompilerType string `json:"compiler_type"`
 	// BinDir must point to a dir that contains compilers required to build
 	// older versions of the kernel. For linux, it needs to include several
 	// compiler versions.
@@ -96,17 +98,19 @@ func main() {
 			TraceWriter: os.Stdout,
 			OutDir:      *flagCrash,
 		},
-		Fix:            *flagFix,
-		BisectCompiler: mycfg.BisectCompiler,
-		BinDir:         mycfg.BinDir,
-		Ccache:         mycfg.Ccache,
+		Fix:             *flagFix,
+		DefaultCompiler: mycfg.Compiler,
+		CompilerType:    mycfg.CompilerType,
+		BinDir:          mycfg.BinDir,
+		Ccache:          mycfg.Ccache,
 		Kernel: bisect.KernelConfig{
-			Repo:      mycfg.KernelRepo,
-			Branch:    mycfg.KernelBranch,
-			Commit:    *flagKernelCommit,
-			Userspace: mycfg.Userspace,
-			Sysctl:    mycfg.Sysctl,
-			Cmdline:   mycfg.Cmdline,
+			Repo:        mycfg.KernelRepo,
+			Branch:      mycfg.KernelBranch,
+			Commit:      *flagKernelCommit,
+			CommitTitle: *flagKernelCommitTitle,
+			Userspace:   mycfg.Userspace,
+			Sysctl:      mycfg.Sysctl,
+			Cmdline:     mycfg.Cmdline,
 		},
 		Syzkaller: bisect.SyzkallerConfig{
 			Repo:   mycfg.SyzkallerRepo,
