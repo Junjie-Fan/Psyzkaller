@@ -40,7 +40,11 @@ type Fuzzer struct {
 	workQueue   *WorkQueue
 	needPoll    chan struct{}
 	choiceTable *prog.ChoiceTable
-	noMutate    map[int]bool
+	//add 2-gram table
+	twogramTable map[int]map[int]float32
+	//add 2-gram fre
+	twogramFre map[int]map[int]int32
+	noMutate   map[int]bool
 	// The stats field cannot unfortunately be just an uint64 array, because it
 	// results in "unaligned 64-bit atomic operation" errors on 32-bit platforms.
 	stats             []uint64
@@ -158,8 +162,8 @@ func main() {
 		flagRawCover = flag.Bool("raw_cover", false, "fetch raw coverage")
 	)
 	defer tool.Init()()
-	outputType := parseOutputType(*flagOutput)
-	log.Logf(0, "fuzzer started")
+	outputType := parseOutputType(*flagOutput) //log输出类型
+	log.Logf(0, "Psyzkaller fuzzer started")
 
 	target, err := prog.GetTarget(*flagOS, *flagArch)
 	if err != nil {
@@ -198,7 +202,7 @@ func main() {
 	}
 
 	machineInfo, modules := collectMachineInfos(target)
-
+	//连接manager RPC
 	log.Logf(0, "dialing manager at %v", *flagManager)
 	manager, err := rpctype.NewRPCClient(*flagManager, timeouts.Scale)
 	if err != nil {
@@ -283,10 +287,10 @@ func main() {
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
-
+	//更新corpus以及candidate队列
 	for needCandidates, more := true, true; more; needCandidates = false {
 		more = fuzzer.poll(needCandidates, nil)
-		// This loop lead to "no output" in qemu emulation, tell manager we are not dead.
+		// This loop lead to "no output" in qemu emulation, tell manager we are not dead
 		log.Logf(0, "fetching corpus: %v, signal %v/%v (executing program)",
 			len(fuzzer.corpus), len(fuzzer.corpusSignal), len(fuzzer.maxSignal))
 	}
@@ -295,12 +299,14 @@ func main() {
 		calls[target.Syscalls[id]] = true
 	}
 	fuzzer.choiceTable = target.BuildChoiceTable(fuzzer.corpus, calls)
+	//build twogramTable
+	fuzzer.twogramTable, fuzzer.twogramFre = target.BuildTwoGramTable()
 
 	if r.CoverFilterBitmap != nil {
 		fuzzer.execOpts.Flags |= ipc.FlagEnableCoverageFilter
 	}
-
-	log.Logf(0, "starting %v fuzzer processes", *flagProcs)
+	//====================================================================================以上为准备
+	log.Logf(0, "starting %v fuzzer processes", *flagProcs) //开始fuzz
 	for pid := 0; pid < *flagProcs; pid++ {
 		proc, err := newProc(fuzzer, pid)
 		if err != nil {
@@ -311,6 +317,7 @@ func main() {
 	}
 
 	fuzzer.pollLoop()
+	//=====================================================================================这部分为关键代码
 }
 
 func collectMachineInfos(target *prog.Target) ([]byte, []host.KernelModule) {
@@ -375,6 +382,7 @@ func (fuzzer *Fuzzer) filterDataRaceFrames(frames []string) {
 	log.Logf(0, "%s", output)
 }
 
+//循环等待、如果程序需要新的语料库，调用poll生成新的数据
 func (fuzzer *Fuzzer) pollLoop() {
 	var execTotal uint64
 	var lastPoll time.Time
@@ -441,7 +449,7 @@ func (fuzzer *Fuzzer) poll(needCandidates bool, stats map[string]uint64) bool {
 	return len(r.NewInputs) != 0 || len(r.Candidates) != 0 || maxSignal.Len() != 0
 }
 
-func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.Input) {
+func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.Input) { //rpc调用，将Input信息传到Manager
 	a := &rpctype.NewInputArgs{
 		Name:  fuzzer.name,
 		Input: inp,
@@ -451,7 +459,7 @@ func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.Input) {
 	}
 }
 
-func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.Input) {
+func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.Input) { //将其他fuzzer的程序信息加到corpus
 	p := fuzzer.deserializeInput(inp.Prog)
 	if p == nil {
 		return
@@ -461,7 +469,7 @@ func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.Input) {
 	fuzzer.addInputToCorpus(p, sign, sig)
 }
 
-func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.Candidate) {
+func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.Candidate) { //将rpc中的Candidate的程序信息入队workqueue
 	p := fuzzer.deserializeInput(candidate.Prog)
 	if p == nil {
 		return
@@ -479,7 +487,7 @@ func (fuzzer *Fuzzer) addCandidateInput(candidate rpctype.Candidate) {
 	})
 }
 
-func (fuzzer *Fuzzer) deserializeInput(inp []byte) *prog.Prog {
+func (fuzzer *Fuzzer) deserializeInput(inp []byte) *prog.Prog { //将byte字节流转化成prog结构
 	p, err := fuzzer.target.Deserialize(inp, prog.NonStrict)
 	if err != nil {
 		log.Fatalf("failed to deserialize prog: %v\n%s", err, inp)
@@ -495,7 +503,7 @@ func (fuzzer *Fuzzer) deserializeInput(inp []byte) *prog.Prog {
 	return p
 }
 
-func (fuzzer *Fuzzer) checkDisabledCalls(p *prog.Prog) {
+func (fuzzer *Fuzzer) checkDisabledCalls(p *prog.Prog) { //查看Prog的syscall是否符合规范
 	for _, call := range p.Calls {
 		if !fuzzer.choiceTable.Enabled(call.Meta.ID) {
 			fmt.Printf("executing disabled syscall %v [%v]\n", call.Meta.Name, call.Meta.ID)
@@ -514,7 +522,7 @@ func (fuzzer *Fuzzer) checkDisabledCalls(p *prog.Prog) {
 	}
 }
 
-func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog {
+func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog { //从corpus随机选择一个prog
 	randVal := r.Int63n(fuzzer.sumPrios + 1)
 	idx := sort.Search(len(fuzzer.corpusPrios), func(i int) bool {
 		return fuzzer.corpusPrios[i] >= randVal
@@ -524,7 +532,7 @@ func (fuzzer *FuzzerSnapshot) chooseProgram(r *rand.Rand) *prog.Prog {
 
 func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig hash.Sig) {
 	fuzzer.corpusMu.Lock()
-	if _, ok := fuzzer.corpusHashes[sig]; !ok {
+	if _, ok := fuzzer.corpusHashes[sig]; !ok { //使用hash判断有无重复的prog，无则加
 		fuzzer.corpus = append(fuzzer.corpus, p)
 		fuzzer.corpusHashes[sig] = struct{}{}
 		prio := int64(len(sign))
@@ -544,7 +552,7 @@ func (fuzzer *Fuzzer) addInputToCorpus(p *prog.Prog, sign signal.Signal, sig has
 	}
 }
 
-func (fuzzer *Fuzzer) snapshot() FuzzerSnapshot {
+func (fuzzer *Fuzzer) snapshot() FuzzerSnapshot { //冻结corpus
 	fuzzer.corpusMu.RLock()
 	defer fuzzer.corpusMu.RUnlock()
 	return FuzzerSnapshot{fuzzer.corpus, fuzzer.corpusPrios, fuzzer.sumPrios}
@@ -559,7 +567,7 @@ func (fuzzer *Fuzzer) addMaxSignal(sign signal.Signal) {
 	fuzzer.maxSignal.Merge(sign)
 }
 
-func (fuzzer *Fuzzer) grabNewSignal() signal.Signal {
+func (fuzzer *Fuzzer) grabNewSignal() signal.Signal { //取出newSignal值，取出后原newSignal置为nil
 	fuzzer.signalMu.Lock()
 	defer fuzzer.signalMu.Unlock()
 	sign := fuzzer.newSignal
@@ -615,7 +623,7 @@ func signalPrio(p *prog.Prog, info *ipc.CallInfo, call int) (prio uint8) {
 	return
 }
 
-func parseOutputType(str string) OutputType {
+func parseOutputType(str string) OutputType { //往哪里输出
 	switch str {
 	case "none":
 		return OutputNone

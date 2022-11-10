@@ -93,7 +93,7 @@ func (ser Serial) Deserialize() Signal {
 	return s
 }
 
-func (s Signal) Diff(s1 Signal) Signal {
+func (s Signal) Diff(s1 Signal) Signal { //取并集且数大
 	if s1.Empty() {
 		return nil
 	}
@@ -124,7 +124,7 @@ func (s Signal) DiffRaw(raw []uint32, prio uint8) Signal {
 	return res
 }
 
-func (s Signal) Intersection(s1 Signal) Signal {
+func (s Signal) Intersection(s1 Signal) Signal { //取交集且小
 	if s1.Empty() {
 		return nil
 	}
@@ -137,7 +137,7 @@ func (s Signal) Intersection(s1 Signal) Signal {
 	return res
 }
 
-func (s *Signal) Merge(s1 Signal) {
+func (s *Signal) Merge(s1 Signal) { //并集且取大
 	if s1.Empty() {
 		return
 	}

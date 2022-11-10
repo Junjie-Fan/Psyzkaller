@@ -57,7 +57,7 @@ func (target *Target) getAnyPtrType(size uint64) *PtrType {
 	panic(fmt.Sprintf("bad pointer size %v", size))
 }
 
-func (target *Target) isAnyPtr(typ Type) bool {
+func (target *Target) isAnyPtr(typ Type) bool { //莫非是任意类型的指针？？？就是void *
 	ptr, ok := typ.(*PtrType)
 	return ok && ptr.Elem == target.any.array
 }

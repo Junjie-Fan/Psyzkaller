@@ -92,7 +92,7 @@ const (
 )
 
 type Type interface {
-	String() string
+	String() string //
 	Name() string
 	TemplateName() string // for template structs name without arguments
 	Optional() bool
@@ -110,12 +110,12 @@ type Type interface {
 	UnitSize() uint64
 	UnitOffset() uint64
 
-	DefaultArg(dir Dir) Arg
-	isDefaultArg(arg Arg) bool
-	generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call)
-	mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool)
-	getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool)
-	minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool
+	DefaultArg(dir Dir) Arg                                                                         //
+	isDefaultArg(arg Arg) bool                                                                      //
+	generate(r *randGen, s *state, dir Dir) (arg Arg, calls []*Call)                                //rand.go
+	mutate(r *randGen, s *state, arg Arg, ctx ArgCtx) (calls []*Call, retry, preserve bool)         //mutation.go
+	getMutationPrio(target *Target, arg Arg, ignoreSpecial bool) (prio float64, stopRecursion bool) //mutation.go
+	minimize(ctx *minimizeArgsCtx, arg Arg, path string) bool                                       //minimization.go
 	ref() Ref
 	setRef(ref Ref)
 }
@@ -703,7 +703,7 @@ func foreachTypeImpl(meta *Syscall, preorder bool, f func(t Type, ctx *TypeCtx))
 	// visit each struct per-syscall (e.g. prio, used resources).
 	seen := make(map[Type]bool)
 	var rec func(*Type, Dir)
-	rec = func(ptr *Type, dir Dir) {
+	rec = func(ptr *Type, dir Dir) { //递归函数
 		ctx := &TypeCtx{Meta: meta, Dir: dir, Ptr: ptr}
 		if preorder {
 			f(*ptr, ctx)

@@ -432,6 +432,11 @@ func (p *Prog) RemoveCall(idx int) {
 	p.Calls = p.Calls[:len(p.Calls)-1]
 }
 
+//addCall add call idx into prog
+func (p *Prog) AddCall(idx int, ct *ChoiceTable) {
+
+}
+
 func (p *Prog) sanitizeFix() {
 	if err := p.sanitize(true); err != nil {
 		panic(err)

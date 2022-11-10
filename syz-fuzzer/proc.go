@@ -84,12 +84,12 @@ func (proc *Proc) loop() {
 
 		ct := proc.fuzzer.choiceTable
 		fuzzerSnapshot := proc.fuzzer.snapshot()
-		if len(fuzzerSnapshot.corpus) == 0 || i%generatePeriod == 0 {
+		if len(fuzzerSnapshot.corpus) == 0 || i%generatePeriod == 0 { //需要生成一个prog
 			// Generate a new prog.
 			p := proc.fuzzer.target.Generate(proc.rnd, prog.RecommendedCalls, ct)
 			log.Logf(1, "#%v: generated", proc.pid)
 			proc.executeAndCollide(proc.execOpts, p, ProgNormal, StatGenerate)
-		} else {
+		} else { //直接变异原有的prog
 			// Mutate an existing prog.
 			p := fuzzerSnapshot.chooseProgram(proc.rnd).Clone()
 			p.Mutate(proc.rnd, prog.RecommendedCalls, ct, proc.fuzzer.noMutate, fuzzerSnapshot.corpus)
@@ -308,7 +308,7 @@ func (proc *Proc) randomCollide(origP *prog.Prog) *prog.Prog {
 	return p
 }
 
-func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.ProgInfo {
+func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.ProgInfo { //运行程序
 	proc.fuzzer.checkDisabledCalls(p)
 
 	// Limit concurrency window and do leak checking once in a while.
@@ -324,7 +324,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 				// It's bad if we systematically fail to serialize programs,
 				// but so far we don't have a better handling than counting this.
 				// This error is observed a lot on the seeded syz_mount_image calls.
-				atomic.AddUint64(&proc.fuzzer.stats[StatBufferTooSmall], 1)
+				atomic.AddUint64(&proc.fuzzer.stats[StatBufferTooSmall], 1) //原子加操作
 				return nil
 			}
 			if try > 10 {
@@ -340,7 +340,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 	}
 }
 
-func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) {
+func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) { //将程序信息输出
 	if proc.fuzzer.outputType == OutputNone {
 		return
 	}
