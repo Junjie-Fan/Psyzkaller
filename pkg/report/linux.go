@@ -370,6 +370,12 @@ func (ctx *linux) Symbolize(rep *Report) error {
 
 	rep.Report = ctx.decompileOpcodes(rep.Report, rep)
 
+	// Skip getting maintainers for Android fuzzing since the kernel source
+	// directory structure is different.
+	if ctx.config.vmType == "cuttlefish" || ctx.config.vmType == "proxyapp" {
+		return nil
+	}
+
 	// We still do this even if we did not symbolize,
 	// because tests pass in already symbolized input.
 	rep.guiltyFile = ctx.extractGuiltyFile(rep)
@@ -920,6 +926,7 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("do_fast_syscall_"),  // syscall entry
 	compile("sysenter_dispatch"), // syscall entry
 	compile("tracesys_phase2"),   // syscall entry
+	compile("el0_svc_handler"),   // syscall entry
 	compile("ret_fast_syscall"),  // arm syscall entry
 	compile("netif_receive_skb"), // net receive entry point
 	compile("do_softirq"),
@@ -963,14 +970,14 @@ var linuxStallAnchorFrames = []*regexp.Regexp{
 	compile("^sock_recvmsg"),
 	compile("^sock_release"),
 	compile("^__sock_release"),
-	compile("__sys_setsockopt"),
+	compile("^setsockopt$"),
 	compile("kernel_setsockopt"),
 	compile("sock_common_setsockopt"),
-	compile("__sys_listen"),
+	compile("^listen$"),
 	compile("kernel_listen"),
 	compile("sk_common_release"),
 	compile("^sock_mmap"),
-	compile("__sys_accept"),
+	compile("^accept$"),
 	compile("kernel_accept"),
 	compile("^sock_do_ioctl"),
 	compile("^sock_ioctl"),
@@ -1038,6 +1045,7 @@ var linuxStackParams = &stackParams{
 		"report_bug",
 		"fixup_bug",
 		"print_report",
+		"print_usage_bug",
 		"do_error",
 		"invalid_op",
 		"_trap",
@@ -1055,6 +1063,7 @@ var linuxStackParams = &stackParams{
 		"kzalloc",
 		"krealloc",
 		"kmem_cache",
+		"allocate_slab",
 		"slab_",
 		"debug_object",
 		"timer_is_static_object",
@@ -1088,10 +1097,9 @@ var linuxStackParams = &stackParams{
 		"down_trylock",
 		"up_read",
 		"up_write",
-		"mutex_lock",
-		"mutex_trylock",
-		"mutex_unlock",
-		"mutex_remove_waiter",
+		"^mutex_",
+		"^__mutex_",
+		"owner_on_cpu",
 		"osq_lock",
 		"osq_unlock",
 		"atomic(64)?_(dec|inc|read|set|or|xor|and|add|sub|fetch|xchg|cmpxchg|try)",
@@ -1217,6 +1225,9 @@ var linuxStackParams = &stackParams{
 		"SYSC_",
 		"SyS_",
 		"sys_",
+		"__x64_",
+		"__ia32_",
+		"__arm64_",
 		"____sys_",
 		"___sys_",
 		"__sys_",
@@ -1224,9 +1235,6 @@ var linuxStackParams = &stackParams{
 		"__do_sys_",
 		"compat_SYSC_",
 		"compat_SyS_",
-		"__x64_",
-		"__ia32_",
-		"__arm64_",
 		"ksys_",
 	},
 }
@@ -1553,6 +1561,7 @@ var linuxOopses = append([]*oops{
 			{
 				title: compile("BUG: .*stack guard page was hit at"),
 				fmt:   "BUG: stack guard page was hit in %[1]v",
+				alt:   []string{"stack-overflow in %[1]v"},
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxRipFrame,
@@ -1706,7 +1715,13 @@ var linuxOopses = append([]*oops{
 			{
 				title:  compile("WARNING: inconsistent lock state"),
 				report: compile("WARNING: inconsistent lock state(?:.*\\n)+?.*takes(?:.*\\n)+?.*at: (?:{{PC}} +)?{{FUNC}}"),
-				fmt:    "inconsistent lock state in %[1]v",
+				fmt:    "inconsistent lock state in %[2]v",
+				stack: &stackFmt{
+					parts: []*regexp.Regexp{
+						linuxCallTrace,
+						parseStackTrace,
+					},
+				},
 			},
 			{
 				title:  compile("WARNING: suspicious RCU usage"),
@@ -1973,12 +1988,26 @@ var linuxOopses = append([]*oops{
 				title:  compile("Kernel panic - not syncing: corrupted stack end"),
 				report: compile("Kernel panic - not syncing: corrupted stack end detected inside scheduler"),
 				fmt:    "kernel panic: corrupted stack end in %[1]v",
+				alt:    []string{"stack-overflow in %[1]v"},
 				stack: &stackFmt{
 					parts: []*regexp.Regexp{
 						linuxCallTrace,
 						parseStackTrace,
 					},
 					skip:      []string{"schedule", "retint_kernel"},
+					extractor: linuxStallFrameExtractor,
+				},
+			},
+			{
+				title: compile("Kernel panic - not syncing: kernel stack overflow"),
+				fmt:   "kernel stack overflow in %[1]v",
+				alt:   []string{"stack-overflow in %[1]v"},
+				stack: &stackFmt{
+					parts: []*regexp.Regexp{
+						linuxCallTrace,
+						parseStackTrace,
+					},
+					skip:      []string{"bad_stack"},
 					extractor: linuxStallFrameExtractor,
 				},
 			},
